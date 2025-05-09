@@ -1,0 +1,41 @@
+#!/bin/bash
+
+set -e
+
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root. Please rerun with 'sudo' or as root."
+    exit 1
+fi
+
+GRUBCFG="/boot/grub/grub.cfg"
+
+default_path=$(btrfs subvolume get-default / | awk '{print $NF}')
+current_path=$(grep -oP '@/\.snapshots/\d+/snapshot' $GRUBCFG | head -n1)
+
+if [[ -z "$current_path" ]]; then
+    echo "Could not find current root subvolume path in $GRUBCFG. Aborting."
+    exit 1
+fi
+
+echo "Default root subvolume: $default_path"
+echo "Current root subvolume: $current_path"
+
+if [[ "$default_path" == "$current_path" ]]; then
+    echo "The default root subvolume is already set in $GRUBCFG. No changes needed."
+    exit 0
+fi
+
+read -rp "Update $GRUBCFG to use the default root subvolume? [Y/n] " confirm
+confirm=${confirm:-Y}
+
+if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    cp $GRUBCFG $GRUBCFG.bak."$(date +%Y%m%d%H%M%S)"
+
+    escaped_old=$(echo "$current_path" | sed 's/[\/&]/\\&/g')
+    escaped_new=$(echo "$default_path" | sed 's/[\/&]/\\&/g')
+    sed -i "s/${escaped_old}/${escaped_new}/g" $GRUBCFG
+
+    echo "Updated $GRUBCFG to use the default root subvolume."
+else
+    echo "Aborted. No changes made."
+fi
