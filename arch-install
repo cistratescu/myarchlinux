@@ -1,0 +1,431 @@
+#!/bin/bash
+
+set -e
+
+countdown() {
+    for i in {5..1}; do
+        echo -n "$i.."
+        sleep 1
+    done
+    echo
+}
+
+prompt() {
+    local output="$1"
+    local text="$2"
+    local input=""
+
+    read -rp "$text" input
+    [ -z "$input" ] && return 1
+
+    eval "$output=\"$input\""
+    return 0
+}
+
+select_prompt() {
+    local output="$1"
+    local text="$2"
+    shift 2
+    local selection="$@"
+    local input=""
+
+    PS3="Input the selection number: "    
+    echo "$text"
+    select input in "$selection"; do break; done
+    [ -z "$input" ] && return 1
+
+    eval "$output=\"$input\""
+    return 0
+}
+
+password_prompt() {
+    local output="$1"
+    local text="$2"
+    local input1=""
+    local input2=""
+
+    read -rsp "$text" input1; echo
+    [ -z "$input1" ] && return 1
+
+    read -rsp "Confirm password: " input2; echo
+    [ "$input1" != "$input2" ] && return 1
+
+    eval "$output=\"$input1\""
+    return 0
+}
+
+password_prompt_allow_empty() {
+    local output="$1"
+    local text="$2"
+    local input1=""
+    local input2=""
+
+    read -rsp "$text" input1; echo
+    [ -z "$input1" ] && return 0
+
+    read -rsp "Confirm password: " input2; echo
+    [ "$input1" != "$input2" ] && return 1
+
+    eval "$output=\"$input1\""
+    return 0
+}
+
+#########################################################################################
+### Handle inputs
+#########################################################################################
+
+parent_path=$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd -P)
+cd "$parent_path"
+
+until select_prompt MY_DISK ">>> Select the disk for installation:" "$(lsblk -dpn -oNAME | grep -P "/dev/sd|nvme|vd")"; do :; done
+until prompt MY_HOSTNAME ">>> Enter host name: "; do :; done
+until prompt MY_USERNAME ">>> Set the admin user name: "; do :; done
+until password_prompt MY_USERPASS ">>> Set the admin user password: "; do :; done
+until password_prompt_allow_empty MY_LUKSPASS ">>> Set the LUKS password (empty reuses previous): "; do :; done
+MY_LUKSPASS="${MY_LUKSPASS:-$MY_USERPASS}"
+until password_prompt_allow_empty MY_ROOTPASS ">>> Set the root user password (empty reuses previous): "; do :; done
+MY_ROOTPASS="${MY_ROOTPASS:-$MY_LUKSPASS}"
+
+echo ">>> Installation parameters:"
+echo "___ Target disk: $MY_DISK"
+echo "___ Host name: $MY_HOSTNAME"
+echo "___ Admin user: $MY_USERNAME"
+
+#########################################################################################
+### Begin installation
+#########################################################################################
+
+echo ">>> Proceeding in:"; countdown
+echo ">>> Starting Arch Linux installation..."
+
+###
+### Partion the disks
+###
+echo ">>> Erasing and partitioning $MY_DISK..."
+
+# Cleanup a previous run
+umount -Rv /mnt || true
+cryptsetup luksClose cryptroot || true
+
+wipefs -af $MY_DISK
+sgdisk -Zo $MY_DISK
+
+sgdisk -n 1:1M:+1G -c 1:ESP -t 1:ef00 $MY_DISK
+sgdisk -n 2:0:0 -c 2:CRYPTROOT -t 2:8309 $MY_DISK
+sgdisk -p $MY_DISK
+
+ESP="/dev/disk/by-partlabel/ESP"
+CRYPTROOT="/dev/disk/by-partlabel/CRYPTROOT"
+
+partprobe "$MY_DISK"
+
+###
+### Create a LUKS container for the root partition
+###
+echo ">>> Creating LUKS container..."
+
+# The defaults for LUKS 2 are not suported by GRUB; we will pick "pbkdf2"
+echo -n "$MY_LUKSPASS" | cryptsetup luksFormat --type luks2 --hash sha256 --pbkdf pbkdf2 "$CRYPTROOT" -d -
+echo -n "$MY_LUKSPASS" | cryptsetup luksOpen "$CRYPTROOT" cryptroot -d -
+
+BTRFS="/dev/mapper/cryptroot"
+
+###
+### Format the partitions
+###
+echo ">>> Formatting the partitions..."
+mkfs.fat -F 32 $ESP
+mkfs.btrfs $BTRFS
+
+###
+### Create BTRFS subvolumes
+###
+echo ">>> Creating BTRFS subvolumes..."
+mount -v "$BTRFS" /mnt
+
+btrfs filesystem label /mnt ARCH
+btrfs filesystem show /mnt
+
+# Non root subvolumes
+SUBVOLUMES=(
+    "var"
+    "usr/local"
+    "srv"
+    "root"
+    "opt"
+    "home"
+    "boot/grub"
+)
+
+for dir in "${SUBVOLUMES[@]}"; do
+    btrfs subvolume create -p /mnt/$dir
+done
+
+btrfs subvolume create -p /mnt/snapshots
+btrfs subvolume create -p /mnt/snapshots/1/snapshot
+
+btrfs subvolume set-default /mnt/snapshots/1/snapshot
+btrfs subvolume get-default /mnt/
+
+chattr -VR +C /mnt/var
+
+umount -Rv /mnt
+
+###
+### Mount the file systems
+###
+echo ">>> Mounting the root filesystem..."
+mount -v $BTRFS /mnt
+for dir in "${SUBVOLUMES[@]}"; do
+    mount -vm -o subvol="$dir" "$BTRFS" /mnt/"$dir"
+done
+mount -vm $ESP /mnt/efi/
+
+# Show the mounted rootfs
+find /mnt
+
+###
+### Install the required packages and some extras
+###
+echo ">>> Installing essential packages..."
+
+kernel="linux" # Other options: linux-hardened, linux-lts, linux-rt, linux-rt-lts
+
+cpu=$(grep vendor_id /proc/cpuinfo | head -n 1)
+[[ "$cpu" == *"GenuineIntel"* ]] && microcode="intel-ucode"
+[[ "$cpu" == *"AuthenticAMD"* ]] && microcode="amd-ucode"
+
+essential="base $kernel linux-firmware $microcode"
+required="base-devel efibootmgr grub btrfs-progs inotify-tools snapper snap-pac grub-btrfs networkmanager reflector plocate rsync zram-generator"
+extra="bash-completion openssh git vim man-db man-pages"
+pacstrap -K /mnt $(echo $essential) $(echo $required) $(echo $extra)
+
+###
+### Create fstab
+###
+echo ">>> Creating fstab..."
+
+BTRFS_UUID=$(blkid -s UUID -o value $BTRFS)
+ESP_UUID=$(blkid -s UUID -o value $ESP)
+
+maxlen="$(printf '/%s\n' ".snapshots" "${SUBVOLUMES[@]}" | wc -L)" # Accounts for .snapshot mount point
+maxlen2="$(printf '/%s\n' "snapshots" "${SUBVOLUMES[@]}" | wc -L)"
+maxlen2="$(($maxlen2+6))" # Accounts for "subvol="
+
+# printf "\n" >> /mnt/etc/fstab
+printf "%-41s  %-${maxlen}s  btrfs  %-${maxlen2}s  0  0\n" "UUID=${BTRFS_UUID}" "/" "defaults" >> /mnt/etc/fstab
+for dir in "${SUBVOLUMES[@]}"; do
+    printf "%-41s  %-${maxlen}s  btrfs  %-${maxlen2}s  0  0\n" "UUID=${BTRFS_UUID}" "/${dir}" "subvol=${dir}" >> /mnt/etc/fstab
+done
+printf "%-41s  %-${maxlen}s  vfat   %-${maxlen2}s  0  2\n" "UUID=${ESP_UUID}" "/efi" "utf8" >> /mnt/etc/fstab
+printf "%-41s  %-${maxlen}s  btrfs  %-${maxlen2}s  0  0\n" "UUID=${BTRFS_UUID}" "/.snapshots" "subvol=snapshots" >> /mnt/etc/fstab
+
+###
+### Configure time
+###
+echo ">>> Configuring time..."
+
+arch-chroot /mnt /bin/bash -e <<EOF
+ln -sf /usr/share/zoneinfo/$(curl -s "http://ip-api.com/line?fields=timezone") /etc/localtime
+hwclock --systohc
+EOF
+
+###
+### Configure localization
+###
+echo ">>> Configuring localization..."
+
+locale="en_US.UTF-8"
+layout="us"
+
+sed -i "/^#$locale/s/^#//" /mnt/etc/locale.gen
+echo "LANG=$locale" > /mnt/etc/locale.conf
+echo "KEYMAP=$layout" > /mnt/etc/vconsole.conf
+
+arch-chroot /mnt locale-gen
+
+###
+### Network configuration
+###
+echo ">>> Configuring network..."
+
+echo "$MY_HOSTNAME" > /mnt/etc/hostname
+echo -e "127.0.0.1 localhost\n::1 localhost\n127.0.1.1 $MY_HOSTNAME" >> /mnt/etc/hosts
+
+systemctl enable NetworkManager --root=/mnt
+
+###
+### Initramfs
+###
+echo ">>> Creating initramfs..."
+
+# Create keyfile
+KEYFILE="etc/cryptsetup-keys.d/cryptroot.key"
+dd bs=512 count=4 if=/dev/random iflag=fullblock | install -m 0600 /dev/stdin /mnt/$KEYFILE
+echo -n "$MY_LUKSPASS" | cryptsetup luksAddKey $CRYPTROOT /mnt/$KEYFILE
+
+# Busybox based (use if you want grub-btrfs-overlayfs)
+# hooks="base udev keyboard autodetect microcode modconf kms keymap consolefont block encrypt filesystems fsck grub-btrfs-overlayfs"
+
+# Systemd based
+hooks="base systemd keyboard autodetect microcode modconf kms sd-vconsole block sd-encrypt filesystems fsck"
+
+sed -i "s,^HOOKS=.*,HOOKS=($hooks)," /mnt/etc/mkinitcpio.conf
+sed -i "s,^FILES=.*,FILES=(/$KEYFILE)," /mnt/etc/mkinitcpio.conf
+arch-chroot /mnt mkinitcpio -P
+
+# Check btrfs module or add MODULES=(btrfs)
+lsinitcpio -a /mnt/boot/initramfs-linux.img
+
+###
+### Bootloader
+###
+echo ">>> Installing GRUB..."
+
+UUID=$(blkid -s UUID -o value $CRYPTROOT)
+
+# Enable support for booting from encrypted disk
+sed -i "s/^#GRUB_ENABLE_CRYPTODISK/GRUB_ENABLE_CRYPTODISK/" /mnt/etc/default/grub
+
+# For the encrypt hook
+# sed -i "\,^GRUB_CMDLINE_LINUX=\"\",s,\",&cryptdevice=UUID=$UUID\:cryptroot cryptkey=rootfs\:/$KEYFILE root=$BTRFS rootfstype=btrfs," /mnt/etc/default/grub
+
+# For systemd-cryptsetup-generator (only if using systemd based initramfs)
+sed -i "\,^GRUB_CMDLINE_LINUX=\"\",s,\",&rd.luks.name=$UUID=cryptroot root=$BTRFS rootfstype=btrfs," /mnt/etc/default/grub
+
+arch-chroot /mnt grub-install --target=x86_64-efi --efi-directory=/efi --boot-directory=/boot --bootloader-id=GRUB
+arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+
+###
+### Add convenience script to update grub.cfg
+###
+echo ">>> Installing GRUB subvolume update script..."
+cp assets/grub-btrfs-subvol-update /mnt/usr/local/bin/
+chmod 755 /mnt/usr/local/bin/grub-btrfs-subvol-update
+
+###
+### Root password
+###
+echo ">>> Setting root password..."
+echo "root:$MY_ROOTPASS" | arch-chroot /mnt chpasswd
+
+###
+### Create user
+###
+echo ">>> Creating user account..."
+
+echo "%wheel ALL=(ALL:ALL) ALL" > /mnt/etc/sudoers.d/wheel
+arch-chroot /mnt useradd -m -G wheel -s /bin/bash "$MY_USERNAME"
+echo "$MY_USERNAME:$MY_USERPASS" | arch-chroot /mnt chpasswd
+
+###
+### ZRAM configuration
+###
+echo ">>> Configuring ZRAM..."
+
+cat > /mnt/etc/systemd/zram-generator.conf <<EOF
+[zram0]
+zram-size = min(ram, 8192)
+compression-algorithm = zstd
+EOF
+
+###
+### Update Pacman DB location
+###
+echo ">>> Updating Pacman DBPath location..."
+
+grep "DBPath" /mnt/etc/pacman.conf
+sed -i "s,^#DBPath.*,DBPath       = /usr/lib/sysimage/pacman/," /mnt/etc/pacman.conf
+
+mkdir -vp /mnt/usr/lib/sysimage/pacman
+rsync -aAXH --numeric-ids /mnt/var/lib/pacman/ /mnt/usr/lib/sysimage/pacman/
+
+# After making sure the copy is fine delete the original
+rm -rf /mnt/var/lib/pacman/
+
+###
+### Set-up Snapper
+###
+echo ">>> Setting up Snapper..."
+
+arch-chroot /mnt /bin/bash -e <<EOF
+# umount -v /.snapshots
+# rm -r /.snapshots
+snapper --no-dbus -c root create-config /
+snapper --no-dbus -c root set-config TIMELINE_CREATE=no
+btrfs subvolume delete /.snapshots
+mkdir /.snapshots
+
+# Should mount the snapshots subvolume from fstab
+mount -av
+
+chmod 750 /.snapshots
+EOF
+
+# Set-up snapper for users
+arch-chroot /mnt /bin/bash -e <<EOF
+snapper --no-dbus -c home create-config /home
+snapper --no-dbus -c home set-config TIMELINE_CREATE=no
+snapper --no-dbus -c home set-config ALLOW_USERS="$MY_USERNAME" SYNC_ACL=yes
+EOF
+
+systemctl disable snapper-timeline.timer snapper-cleanup.timer --root=/mnt
+
+# Make plocate ignore the .snapshots directory
+sed -i '/^PRUNENAMES *=/ s/"$/ .snapshots"/' /mnt/etc/updatedb.conf
+
+# Register the root filesystem subvolume with snapper
+cat <<EOF > /mnt/.snapshots/1/info.xml
+<?xml version="1.0"?>
+<snapshot>
+  <type>single</type>
+  <num>1</num>
+  <date>$(date -u +"%F %T")</date>
+  <description>first root filesystem</description>
+</snapshot>
+EOF
+
+###
+### Finalizing instalation
+###
+echo ">>> Finalizing instalation..."
+
+# Pacman colors
+sed -i "s/^#Color/Color/" /mnt/etc/pacman.conf
+
+# Enable useful services
+services=(reflector.timer grub-btrfsd.service systemd-oomd)
+for service in "${services[@]}"; do
+    systemctl enable "$service" --root=/mnt
+done
+
+###
+### Take an "after installation" snapshot
+###
+echo ">>> Taking an initial snapshot..."
+
+mkdir /mnt/.snapshots/2
+cat <<EOF > /mnt/.snapshots/2/info.xml
+<?xml version="1.0"?>
+<snapshot>
+  <type>single</type>
+  <num>2</num>
+  <date>$(date -u +"%F %T")</date>
+  <description>after installation</description>
+</snapshot>
+EOF
+btrfs subvolume snapshot -r /mnt /mnt/.snapshots/2/snapshot
+
+# Confirm that snapper registered the snapshot
+arch-chroot /mnt snapper --no-dbus ls
+
+# Create grub snapshot menu
+arch-chroot /mnt grub-mkconfig -o /boot/grub/grub.cfg
+
+#########################################################################################
+### Installation done
+#########################################################################################
+
+echo ">>> Installation done..."
+echo "___ To boot into the installed system run:"
+echo "___ umount -Rv /mnt && cryptsetup luksClose cryptroot && reboot"
