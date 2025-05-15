@@ -380,6 +380,16 @@ EOF
 }; do_snapshot &>> $LOGFILE
 echo -e "${BOLD}${GREEN}OK${NORMAL}"
 
+echo -ne "${BOLD}Add post-installer to admin user home... ${NORMAL}"
+do_postinstall_prep() {
+    local target_dir; target_dir="/home/$MY_USERNAME/$(basename "$PWD")"
+    mkdir "/mnt/$target_dir"
+    cp -a . "/mnt/$target_dir"
+    arch-chroot /mnt chown -R "$MY_USERNAME":"$MY_USERNAME" "$target_dir"
+    arch-chroot /mnt chmod +x "$target_dir/post-install"
+}; do_postinstall_prep &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
 #########################################################################################
 ### Installation done
 #########################################################################################
