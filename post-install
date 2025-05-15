@@ -1,0 +1,55 @@
+#!/bin/bash
+
+set -ueo pipefail
+
+PARENT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd -P)
+cd "$PARENT_PATH"
+
+source scripts/utils.sh
+
+# Colors
+BOLD='\e[1m'
+NORMAL='\e[0m'
+
+echo -e "${BOLD}Installing COSMIC desktop environment${NORMAL}"
+echo -e "  Extras: vscode, google-chrome"
+echo -ne "${BOLD}Proceeding in${NORMAL} "; countdown
+
+#########################################################################################
+### Run the installation process
+#########################################################################################
+
+do_audio() {
+    # pipewire: modern audio framework
+    # wireplumber: pipewire session and policy manager (replaces pipewire-media-session)
+    # pipewire-pulse libpulse: support for pulseaudio applications (e.g. most desktop apps)
+    # pipewire-alsa: support for ALSA applications (e.g. older apps/games)
+    # pipewire-jack: support for JACK applications (e.g. professional audio)
+    sudo pacman -Syu pipewire wireplumber pipewire-alsa pipewire-jack pipewire-pulse libpulse
+}; do_audio
+
+do_desktop() {
+    exclude_list=("cosmic-store" "cosmic-text-editor")
+    desktop=$(pacman -Sg cosmic | awk '{print $2}' | grep -vFf <(printf '%s\n' "${exclude_list[@]}"))
+    # shellcheck disable=2086
+    sudo pacman -S $desktop firefox
+    sudo systemctl enable cosmic-greeter.service
+}; do_desktop
+
+do_extras() {
+    # Install AUR helper
+    sudo pacman -S --needed git base-devel
+    git clone https://aur.archlinux.org/yay.git
+    cd yay && makepkg -si && cd ..
+
+    yay visual-studio-code-bin
+    yay google-chrome
+    sudo pacman -S podman
+}; do_extras
+
+#########################################################################################
+### Installation done
+#########################################################################################
+
+echo -e "${BOLD}Desktop environment installation done${NORMAL}"
+echo -e "  Run 'start-cosmic' or reboot to begin using the COSMIC desktop"
