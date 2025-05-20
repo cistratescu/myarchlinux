@@ -20,6 +20,35 @@ echo -ne "${BOLD}Proceeding in${NORMAL} "; countdown
 #########################################################################################
 
 do_audio() {
+    #TODO: check if snd_sof in loaded modules, then
+    sudo pacman -S sof-firmware
+
+    #TODO: ALSA modules
+    # "snd_asihpi",
+    # "snd_cs46xx",
+    # "snd_darla20",
+    # "snd_darla24",
+    # "snd_echo3g",
+    # "snd_emu10k1",
+    # "snd_gina20",
+    # "snd_gina24",
+    # "snd_hda_codec_ca0132",
+    # "snd_hdsp",
+    # "snd_indigo",
+    # "snd_indigodj",
+    # "snd_indigodjx",
+    # "snd_indigoio",
+    # "snd_indigoiox",
+    # "snd_layla20",
+    # "snd_layla24",
+    # "snd_mia",
+    # "snd_mixart",
+    # "snd_mona",
+    # "snd_pcxhr",
+    # "snd_vx_lib",
+    # then
+    # sudo pacman -S alsa-firmware
+
     # pipewire: modern audio framework
     # wireplumber: pipewire session and policy manager (replaces pipewire-media-session)
     # pipewire-pulse libpulse: support for pulseaudio applications (e.g. most desktop apps)
@@ -32,8 +61,9 @@ do_desktop() {
     exclude_list=("cosmic-store" "cosmic-text-editor")
     desktop=$(pacman -Sg cosmic | awk '{print $2}' | grep -vFf <(printf '%s\n' "${exclude_list[@]}"))
     # shellcheck disable=2086
-    sudo pacman -S $desktop firefox
-    sudo systemctl enable cosmic-greeter.service
+    sudo pacman -S $desktop dconf xdg-user-dirs power-profiles-daemon firefox
+    sudo systemctl enable --now power-profiles-daemon.service cosmic-greeter.service
+    # Todo: check how I can remove the excluded apps from tray programatically
 }; do_desktop
 
 do_extras() {
@@ -44,8 +74,29 @@ do_extras() {
 
     yay visual-studio-code-bin
     yay google-chrome
-    sudo pacman -S podman
+    yay vi-vim-symlink
 }; do_extras
+
+do_virt() {
+    sudo pacman -S qemu-desktop dnsmasq iptables-nft libvirt virt-manager
+    systemctl enable --now libvirtd.service
+}
+
+do_gnome() {
+    sudo pacman -S gnome power-profiles-daemon
+    sudo systemctl enable --now power-profiles-daemon.service gdm.service
+}
+
+do_containers() {
+    sudo pacman -S podman
+}
+
+do_bluetooth() {
+    sudo pacman -S bluez bluez-utils
+    # Check that kernel module is loaded
+    lsmod | gret btusb | wc -l
+    sudo systemctl enable --now bluetooth.service
+}
 
 #########################################################################################
 ### Installation done
