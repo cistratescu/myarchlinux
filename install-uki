@@ -1,0 +1,383 @@
+#!/bin/bash
+
+set -ueo pipefail
+
+PARENT_PATH=$(cd "$(dirname "${BASH_SOURCE[0]}")"; pwd -P)
+cd "$PARENT_PATH"
+
+source scripts/utils.sh
+
+# Log path
+LOGFILE="logs/install.log"
+: > $LOGFILE
+
+# Colors
+BOLD='\e[1m'
+NORMAL='\e[0m'
+GREEN='\e[32m'
+
+#########################################################################################
+### Prompt for the installation parameters
+#########################################################################################
+
+do_interact() {
+    local text options
+
+    text="${BOLD}Select the disk for installation${NORMAL}"
+    readarray -t options < <(lsblk -dpn -oNAME | grep -P "/dev/sd|nvme|vd")
+    until prompt_select "$text" MY_DISK "${options[@]}"; do :; done
+
+    text="${BOLD}Set the LUKS password${NORMAL}"
+    until prompt_password "$text" MY_LUKSPASS; do :; done
+
+    text="${BOLD}Enter the host name${NORMAL} (default: archlinux)"
+    until prompt_with_default "$text" "archlinux" MY_HOSTNAME ; do :; done
+
+    text="${BOLD}Enter the admin user name${NORMAL}"
+    until prompt "$text" MY_USERNAME ; do :; done
+
+    text="${BOLD}Set the admin user password${NORMAL} (default: LUKS password)"
+    until prompt_password_with_default "$text" "$MY_LUKSPASS" MY_USERPASS ; do :; done
+
+    text="${BOLD}Set the root user password${NORMAL} (default: admin password)"
+    until prompt_password_with_default "$text" "$MY_USERPASS" MY_ROOTPASS ; do :; done
+
+    echo -e "${BOLD}Installing Arch Linux with the following settings${NORMAL}"
+    echo -e "  Target disk: $MY_DISK"
+    echo -e "  Admin user: $MY_USERNAME"
+    echo -e "  Host name: $MY_HOSTNAME"
+    echo -ne "${BOLD}Proceeding in${NORMAL} "; countdown
+}; do_interact
+
+#########################################################################################
+### Run the installation process
+#########################################################################################
+
+echo -ne "${BOLD}Erasing and partitioning disk... ${NORMAL}"
+do_partitioning() {
+    # Cleanup a previous run
+    umount -Rv /mnt || true
+    cryptsetup luksClose cryptroot || true
+    wipefs -af "$MY_DISK" || true
+    sgdisk -Zo "$MY_DISK" || true
+    partprobe "$MY_DISK"
+    
+    sgdisk -n 1:1M:+8G -c 1:ESP -t 1:ef00 "$MY_DISK"
+    sgdisk -n 2:0:0 -c 2:CRYPTROOT -t 2:8309 "$MY_DISK"
+    sgdisk -p "$MY_DISK"
+    partprobe "$MY_DISK"
+    udevadm settle
+    ESP="/dev/disk/by-partlabel/ESP"
+    CRYPTROOT="/dev/disk/by-partlabel/CRYPTROOT"
+}; do_partitioning &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Creating LUKS container... ${NORMAL}"
+do_luks() {
+    # Wait for the labeled root partition
+    until [[ -b "$CRYPTROOT" ]]; do sleep 1; done
+    # The defaults for LUKS 2 are not suported by GRUB; we will pick "pbkdf2"
+    echo -n "$MY_LUKSPASS" | cryptsetup luksFormat --type luks2 --hash sha256 --pbkdf pbkdf2 "$CRYPTROOT" -d -
+    echo -n "$MY_LUKSPASS" | cryptsetup luksOpen "$CRYPTROOT" cryptroot -d -
+    BTRFS="/dev/mapper/cryptroot"
+}; do_luks &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Formatting the partitions... ${NORMAL}"
+do_format() {
+    mkfs.fat -F 32 $ESP
+    mkfs.btrfs $BTRFS
+}; do_format &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Creating BTRFS subvolumes... ${NORMAL}"
+do_btrfs() {
+    # Non root subvolumes
+    SUBVOLUMES=(
+        ".snapshots"
+        "home"
+        "srv"
+        "swap"
+        "var/log"
+        "var/tmp"
+        "var/cache"
+        "var/crash"
+        "var/spool"
+        "var/lib/libvirt/images"
+    )
+
+    mount -v "$BTRFS" /mnt
+    btrfs filesystem label /mnt ROOTFS
+    btrfs filesystem show /mnt
+
+    btrfs subvolume create /mnt/@
+    for dir in "${SUBVOLUMES[@]}"; do
+        btrfs subvolume create -p /mnt/@/"$dir"
+    done
+    btrfs subvolume create -p /mnt/@/.snapshots/1/snapshot
+    btrfs subvolume set-default /mnt/@/.snapshots/1/snapshot
+    btrfs subvolume get-default /mnt/
+
+    chattr -VR +C /mnt/@/var/lib/libvirt/images
+    chattr -VR +C /mnt/@/swap
+
+    umount -Rv /mnt
+}; do_btrfs &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Mounting the root filesystem... ${NORMAL}"
+do_mount() {
+    MOUNTOPTS="defaults,noatime,compress=zstd"
+    mount -v -o "$MOUNTOPTS" "$BTRFS" /mnt
+    for dir in "${SUBVOLUMES[@]}"; do
+        mount -vm -o "$MOUNTOPTS,subvol=@/$dir" "$BTRFS" /mnt/"$dir"
+    done
+    mount -vm $ESP /mnt/efi/
+
+    # Show the mounted rootfs
+    find /mnt || true
+}; do_mount &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Installing essential packages... ${NORMAL}"
+do_install() {
+    local kernel cpu base extra
+    kernel="linux" # Other options: linux-hardened, linux-lts, linux-rt, linux-rt-lts
+    cpu=$(grep vendor_id /proc/cpuinfo | head -n 1)
+    [[ "$cpu" == *"GenuineIntel"* ]] && microcode="intel-ucode"
+    [[ "$cpu" == *"AuthenticAMD"* ]] && microcode="amd-ucode"
+    base="base base-devel $kernel linux-firmware $microcode systemd-ukify efibootmgr btrfs-progs snapper snap-pac networkmanager openssh reflector plocate"
+    extra="git vim rsync bash-completion man-db man-pages"
+    # shellcheck disable=SC2086
+    pacstrap -K /mnt $base $extra
+}; do_install &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Creating swap file... ${NORMAL}"
+do_swap() {
+    local memtotal
+    memtotal=$(free -k | awk '/Mem:/ {print $2}')
+    SWAPFILE="swap/swapfile"
+    btrfs filesystem mkswapfile --size "${memtotal}"k --uuid clear /mnt/"$SWAPFILE"
+}; do_swap &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Creating fstab... ${NORMAL}"
+do_fstab() {
+    ESP_UUID=$(blkid -s UUID -o value $ESP)
+
+    local maxlen0 maxlen1 maxlen2
+    maxlen0="$(printf '%s\nUUID=%s\n%s\n' $BTRFS "$ESP_UUID" "/${SWAPFILE}" | wc -L)" 
+    maxlen1="$(printf '/%s\n' "${SUBVOLUMES[@]}" | wc -L)"
+    maxlen2="$((maxlen1+${#MOUNTOPTS}+9))" # Accounts for "$MOUNTOPTS,subvol=@"
+
+    printf "%-${maxlen0}s  %-${maxlen1}s  btrfs  %-${maxlen2}s  0  0\n" "${BTRFS}" "/" "$MOUNTOPTS" >> /mnt/etc/fstab
+    for dir in "${SUBVOLUMES[@]}"; do
+    printf "%-${maxlen0}s  %-${maxlen1}s  btrfs  %-${maxlen2}s  0  0\n" "${BTRFS}" "/${dir}" "$MOUNTOPTS,subvol=@/${dir}" >> /mnt/etc/fstab
+    done
+    printf "%-${maxlen0}s  %-${maxlen1}s  vfat   %-${maxlen2}s  0  2\n" "UUID=${ESP_UUID}" "/efi" "utf8" >> /mnt/etc/fstab
+    printf "%-${maxlen0}s  %-${maxlen1}s  swap   %-${maxlen2}s  0  0\n" "/${SWAPFILE}" "none" "defaults" >> /mnt/etc/fstab
+}; do_fstab &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Configuring time and localization... ${NORMAL}"
+do_time() {
+    arch-chroot /mnt /bin/bash -e <<EOF
+ln -sf /usr/share/zoneinfo/$(curl -s "http://ip-api.com/line?fields=timezone") /etc/localtime
+hwclock --systohc
+EOF
+}
+do_locale() {
+    local locale layout
+    locale="en_US.UTF-8"
+    layout="us"
+    sed -i "/^#$locale/s/^#//" /mnt/etc/locale.gen
+    echo "LANG=$locale" > /mnt/etc/locale.conf
+    echo "KEYMAP=$layout" > /mnt/etc/vconsole.conf
+    arch-chroot /mnt locale-gen
+}
+do_time &>> $LOGFILE
+do_locale &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Configuring network... ${NORMAL}"
+do_network() {
+    echo "$MY_HOSTNAME" > /mnt/etc/hostname
+    echo -e "127.0.1.1        $MY_HOSTNAME" >> /mnt/etc/hosts
+
+    systemctl enable NetworkManager --root=/mnt
+}; do_network &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Configuring UKI... ${NORMAL}"
+do_uki() {
+    UUID=$(blkid -s UUID -o value $CRYPTROOT)
+    sed -i "s/^#default_uki/default_uki/" /mnt/etc/mkinitcpio.d/linux.preset
+    sed -i "s/^#default_options/default_options/" /mnt/etc/mkinitcpio.d/linux.preset
+    sed -i "s/^#fallback_uki/fallback_uki/" /mnt/etc/mkinitcpio.d/linux.preset
+    sed -i "s/^#fallback_options/fallback_options/" /mnt/etc/mkinitcpio.d/linux.preset
+
+    cat > /mnt/etc/kernel/cmdline <<EOF
+&rd.luks.name=$UUID=cryptroot root=$BTRFS rootfstype=btrfs loglevel=3 quiet zswap.enabled=1 zswap.compressor=lz4
+EOF
+    cat > /mnt/etc/kernel/cmdline_fallback <<EOF
+&rd.luks.name=$UUID=cryptroot root=$BTRFS rootfstype=btrfs
+EOF
+    sed -i '/^fallback_options *=/ s,"$, --cmdline /etc/kernel/cmdline_fallback",' /mnt/etc/updatedb.conf
+}; do_uki &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+echo -ne "${BOLD}Creating initramfs... ${NORMAL}"
+do_initramfs() {
+    local hooks
+    hooks="base systemd keyboard autodetect microcode modconf kms sd-vconsole block sd-encrypt filesystems fsck"
+
+    sed -i "s,^HOOKS=.*,HOOKS=($hooks)," /mnt/etc/mkinitcpio.conf
+    arch-chroot /mnt mkinitcpio -P
+
+    # Check btrfs module or add MODULES=(btrfs)
+    lsinitcpio -a /mnt/boot/initramfs-linux.img
+}; do_initramfs &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Setting root password... ${NORMAL}"
+echo "root:$MY_ROOTPASS" | arch-chroot /mnt chpasswd &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Creating admin user account... ${NORMAL}"
+do_user() {
+    echo "%wheel ALL=(ALL:ALL) ALL" > /mnt/etc/sudoers.d/wheel
+    arch-chroot /mnt useradd -m -G wheel -s /bin/bash "$MY_USERNAME"
+    echo "$MY_USERNAME:$MY_USERPASS" | arch-chroot /mnt chpasswd
+}; do_user &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+# echo -ne "${BOLD}Configuring swap on ZRAM... ${NORMAL}"
+do_zram() {
+    # shellcheck disable=SC2317
+    pacstrap /mnt zram-generator
+    # shellcheck disable=SC2317
+    cat > /mnt/etc/systemd/zram-generator.conf <<EOF
+[zram0]
+zram-size = min(ram, 8192)
+compression-algorithm = zstd
+EOF
+}; # do_zram &>> $LOGFILE
+# echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+echo -ne "${BOLD}Updating Pacman DBPath location... ${NORMAL}"
+do_pacmandb() {
+    grep "DBPath" /mnt/etc/pacman.conf
+    sed -i "s,^#DBPath.*,DBPath       = /usr/lib/sysimage/pacman/," /mnt/etc/pacman.conf
+
+    mkdir -vp /mnt/usr/lib/sysimage/pacman
+    rsync -aAXH --numeric-ids /mnt/var/lib/pacman/ /mnt/usr/lib/sysimage/pacman/
+    # After making sure the copy is fine delete the original
+    rm -rf /mnt/var/lib/pacman/
+}; do_pacmandb &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Setting up snapshot support... ${NORMAL}"
+do_snapper() {
+    # Set-up snapper for rootfs
+    arch-chroot /mnt /bin/bash -e <<EOF
+umount -Rv /.snapshots
+rm -r /.snapshots
+snapper --no-dbus -c root create-config /
+btrfs subvolume delete /.snapshots
+mkdir /.snapshots
+
+# Should mount the snapshots subvolume from fstab
+mount -av
+
+chmod 750 /.snapshots
+
+snapper --no-dbus -c root setup-quota
+snapper --no-dbus -c root set-config TIMELINE_CREATE=no NUMBER_LIMIT="2-10" NUMBER_LIMIT_IMPORTANT="4-10"
+EOF
+
+    # Set-up snapper for /home
+    arch-chroot /mnt /bin/bash -e <<EOF
+snapper --no-dbus -c home create-config /home
+snapper --no-dbus -c home setup-quota
+snapper --no-dbus -c home set-config TIMELINE_CREATE=no NUMBER_LIMIT="2-10" NUMBER_LIMIT_IMPORTANT="4-10"
+snapper --no-dbus -c home set-config ALLOW_USERS="$MY_USERNAME" SYNC_ACL=yes
+EOF
+
+    systemctl enable snapper-timeline.timer snapper-cleanup.timer --root=/mnt
+
+    # Make plocate ignore the .snapshots directory
+    sed -i '/^PRUNENAMES *=/ s/"$/ .snapshots"/' /mnt/etc/updatedb.conf
+
+    # Register the root filesystem subvolume with snapper
+    cat <<EOF > /mnt/.snapshots/1/info.xml
+<?xml version="1.0"?>
+<snapshot>
+  <type>single</type>
+  <num>1</num>
+  <date>$(date -u +"%F %T")</date>
+  <description>first root filesystem</description>
+</snapshot>
+EOF
+}; do_snapper &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Finalizing instalation... ${NORMAL}"
+do_misc() {
+    # Pacman colors
+    sed -i "s/^#Color/Color/" /mnt/etc/pacman.conf
+    # Enable useful services
+    services=(reflector.timer grub-btrfsd.service systemd-oomd)
+    for service in "${services[@]}"; do
+        systemctl enable "$service" --root=/mnt
+    done
+}; do_misc &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+
+echo -ne "${BOLD}Taking an initial snapshot... ${NORMAL}"
+do_snapshot() {
+    arch-chroot /mnt /bin/bash -e <<EOF
+snapper --no-dbus create -d "after installation"
+snapper --no-dbus ls
+grub-mkconfig -o /boot/grub/grub.cfg
+
+snapper --no-dbus -c home create -d "after installation"
+snapper --no-dbus -c home ls
+EOF
+}; do_snapshot &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+echo -ne "${BOLD}Add post-installer to admin user home... ${NORMAL}"
+do_postinstall_prep() {
+    local target_dir; target_dir="/home/$MY_USERNAME/$(basename "$PWD")"
+    mkdir "/mnt/$target_dir"
+    cp -a . "/mnt/$target_dir"
+    arch-chroot /mnt chown -R "$MY_USERNAME":"$MY_USERNAME" "$target_dir"
+    arch-chroot /mnt chmod +x "$target_dir/post-install"
+}; do_postinstall_prep &>> $LOGFILE
+echo -e "${BOLD}${GREEN}OK${NORMAL}"
+
+#########################################################################################
+### Installation done
+#########################################################################################
+
+echo -e "${BOLD}Installation done${NORMAL}"
+echo -e "  Log file path: $PARENT_PATH/$LOGFILE"
+echo -e "  To boot into the installed system run:"
+echo -e "  umount -Rv /mnt && cryptsetup luksClose cryptroot && reboot"
